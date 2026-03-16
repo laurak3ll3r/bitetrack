@@ -33,7 +33,9 @@ const CONFIG = {
   SETTLE_MS:            300,   // ms — signal must stay below threshold before bite is finalised
   STATS_REFRESH_MS:     500,   // ms — live stats update interval
   MOTION_BAR_MAX:       200,   // deg/s — full-scale value for motion bar
-  SUBMIT_URL: 'https://script.google.com/macros/s/AKfycbwyzboILipQTfWY4DMGVDLr1qeG_-nG_sxpmFTFhAFcts3qHzI8rIf1bEbpB5FZfe0DZQ/exec',
+  // DataFoundry (TU/e) endpoint
+  DATAFOUNDRY_URL:   'https://data.id.tue.nl/api/v1/datasets/entity/19856',
+  DATAFOUNDRY_TOKEN: 'OCtQVi9wOTdpQ005L3E1MlIvdDZSRGl5emlMdnhEL2RNbGxNRlZIZjVqND0=',
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -89,6 +91,7 @@ const ui = {
   fieldContext:     document.getElementById('fieldContext'),
   fieldStress:      document.getElementById('fieldStress'),
   fieldDistraction: document.getElementById('fieldDistraction'),
+  fieldFood:        document.getElementById('fieldFood'),
   fieldNotes:       document.getElementById('fieldNotes'),
 };
 
@@ -550,6 +553,7 @@ async function submitSurvey(e) {
   const context     = ui.fieldContext.value;
   const stress      = ui.fieldStress.value;
   const distraction = ui.fieldDistraction.value;
+  const food        = ui.fieldFood.value.trim();
   const notes       = ui.fieldNotes.value.trim();
 
   if (!name || !context || !stress || !distraction) {
@@ -567,27 +571,40 @@ async function submitSurvey(e) {
   showSubmitStatus('Sending…', '');
 
   try {
-    // Google Apps Script requires no-cors — data still lands in the sheet,
-    // but we cannot read the response body (opaque response).
-    await fetch(CONFIG.SUBMIT_URL, {
+    // Send to DataFoundry (TU/e)
+    // resource_id = participant name, token = stress level (acts as a simple session key)
+    const res = await fetch(CONFIG.DATAFOUNDRY_URL, {
       method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type':  'application/json',
+        'api_token':     CONFIG.DATAFOUNDRY_TOKEN,
+        'resource_id':   `${name}_${food || 'unknown'}_${new Date().toISOString().slice(0,10)}`,  // e.g. "Anna_pasta_2026-03-16"
+        'token':         `${name}_${food || 'unknown'}_${new Date().toISOString().slice(0,10)}`,  // same identifier as token
+      },
       body: JSON.stringify({
-        name, context, stress, distraction, notes,
-        meal_time: (mealMs / 1000).toFixed(1),
-        bites: bites.length,
-        avg_bite_duration: avgDur,
-        pace,
-        bite_durations: biteDurs,
+        name,
+        context,
+        stress,
+        distraction,
+        food,
+        notes,
+        meal_time_seconds:  parseFloat((mealMs / 1000).toFixed(1)),
+        bite_count:         bites.length,
+        avg_bite_duration:  avgDur,
+        pace_bites_per_min: pace,
+        bite_durations:     biteDurs.join(','),
       }),
     });
-    // Reaching here means the request was sent — treat as success
-    showSubmitStatus('Submitted successfully! ✓', 'success');
-    ui.btnSubmit.textContent = 'Submitted ✓';
+
+    if (res.ok) {
+      showSubmitStatus('Submitted successfully! ✓', 'success');
+      ui.btnSubmit.textContent = 'Submitted ✓';
+    } else {
+      const msg = await res.text();
+      throw new Error(`HTTP ${res.status}: ${msg}`);
+    }
   } catch (err) {
-    // Only fires on network-level failure (offline, DNS, etc.)
-    showSubmitStatus('Submission failed. Check your connection and try again.', 'error');
+    showSubmitStatus('Submission failed: ' + err.message, 'error');
     ui.btnSubmit.disabled = false;
     console.error('[BiteTrack]', err);
   }
