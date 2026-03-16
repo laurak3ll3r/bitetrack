@@ -29,7 +29,8 @@ const CONFIG = {
   BITE_THRESHOLD:       40,    // deg/s — rotation magnitude to start a bite
   BITE_MIN_DURATION_MS: 150,   // ms — minimum burst to count as a bite
   BITE_MAX_DURATION_MS: 2000,  // ms — cap to filter sustained non-bite motion
-  COOLDOWN_MS:          400,   // ms — dead zone after each bite
+  COOLDOWN_MS:          1200,  // ms — dead zone after each bite (covers full up+down arc)
+  SETTLE_MS:            300,   // ms — signal must stay below threshold before bite is finalised
   STATS_REFRESH_MS:     500,   // ms — live stats update interval
   MOTION_BAR_MAX:       200,   // deg/s — full-scale value for motion bar
   SUBMIT_URL: 'https://script.google.com/macros/s/AKfycbwyzboILipQTfWY4DMGVDLr1qeG_-nG_sxpmFTFhAFcts3qHzI8rIf1bEbpB5FZfe0DZQ/exec',
@@ -44,8 +45,11 @@ const state = {
   mealActive:       false,
   mealStartTime:    null,
   mealEndTime:      null,
-  aboveThreshold:   false,
+  aboveThreshold:   false,  // legacy (kept for reference)
+  bitePhase:        'idle', // 'idle' | 'active' | 'settling'
   biteStartTime:    null,
+  bitePeak:         0,      // highest magnitude seen in current bite arc
+  settleStart:      null,   // when signal last dropped below threshold
   lastBiteEndTime:  0,
   bites:            [],   // { start, end, duration }
   statsTimer:       null,
@@ -154,31 +158,74 @@ function onDeviceMotion(event) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Two-state machine:
- *   IDLE   → magnitude ≥ THRESHOLD (and not in cooldown) → ACTIVE
- *   ACTIVE → magnitude drops below THRESHOLD → validate duration → record or discard
+ * Envelope-based bite detector — one bite per full up+down arc.
+ *
+ * The key insight: a single fork-to-mouth motion produces TWO magnitude
+ * peaks (lift up, lower down). Naive threshold crossing counts both.
+ *
+ * Solution: once we cross the threshold, we track the PEAK magnitude
+ * reached. We only finalise the bite after the signal has been below
+ * the threshold continuously for SETTLE_MS — meaning the whole arc
+ * (both the up and the down swing) has fully completed before we record.
+ *
+ * States:
+ *   IDLE    → magnitude ≥ THRESHOLD (not in cooldown) → ACTIVE (start tracking peak)
+ *   ACTIVE  → keep updating peak while above threshold
+ *           → drops below threshold → enter SETTLING (start settle timer)
+ *   SETTLING → magnitude stays low for SETTLE_MS → record bite, enter cooldown
+ *            → magnitude rises above threshold again → back to ACTIVE (same bite, still moving)
  */
 function detectBite(magnitude) {
   const now        = Date.now();
   const inCooldown = (now - state.lastBiteEndTime) < CONFIG.COOLDOWN_MS;
 
-  if (!state.aboveThreshold) {
+  if (state.bitePhase === 'idle') {
+    // ── IDLE → ACTIVE
     if (magnitude >= CONFIG.BITE_THRESHOLD && !inCooldown) {
-      state.aboveThreshold = true;
-      state.biteStartTime  = now;
+      state.bitePhase     = 'active';
+      state.biteStartTime = now;
+      state.bitePeak      = magnitude;
+      state.settleStart   = null;
     }
-  } else {
+
+  } else if (state.bitePhase === 'active') {
+    // ── ACTIVE: track peak; wait for signal to drop
+    if (magnitude > state.bitePeak) state.bitePeak = magnitude;
+
     if (magnitude < CONFIG.BITE_THRESHOLD) {
-      state.aboveThreshold = false;
-      const duration = now - state.biteStartTime;
+      // Signal dropped — start settling timer
+      state.bitePhase   = 'settling';
+      state.settleStart = now;
+    }
+
+    // Safety: if a single "bite" runs impossibly long, discard and reset
+    if (now - state.biteStartTime > CONFIG.BITE_MAX_DURATION_MS * 2) {
+      state.bitePhase     = 'idle';
+      state.biteStartTime = null;
+      state.bitePeak      = 0;
+      state.settleStart   = null;
+    }
+
+  } else if (state.bitePhase === 'settling') {
+    if (magnitude >= CONFIG.BITE_THRESHOLD) {
+      // Signal came back up — still the same arm motion, stay active
+      state.bitePhase   = 'active';
+      state.settleStart = null;
+    } else if (now - state.settleStart >= CONFIG.SETTLE_MS) {
+      // Signal stayed low long enough — the full arc is complete
+      const duration = state.settleStart - state.biteStartTime;
 
       if (duration >= CONFIG.BITE_MIN_DURATION_MS && duration <= CONFIG.BITE_MAX_DURATION_MS) {
-        recordBite(state.biteStartTime, now, duration);
+        recordBite(state.biteStartTime, state.settleStart, duration);
       }
 
       state.lastBiteEndTime = now;
+      state.bitePhase       = 'idle';
       state.biteStartTime   = null;
+      state.bitePeak        = 0;
+      state.settleStart     = null;
     }
+    // else: still settling, keep waiting
   }
 }
 
@@ -200,7 +247,10 @@ function startMeal() {
     mealEndTime: null,
     bites: [],
     aboveThreshold: false,
+    bitePhase: 'idle',
     biteStartTime: null,
+    bitePeak: 0,
+    settleStart: null,
     lastBiteEndTime: 0,
   });
 
@@ -240,7 +290,8 @@ function resetAll() {
   clearInterval(state.statsTimer);
   Object.assign(state, {
     mealActive: false, mealStartTime: null, mealEndTime: null,
-    bites: [], aboveThreshold: false, biteStartTime: null, lastBiteEndTime: 0,
+    bites: [], aboveThreshold: false, bitePhase: 'idle', biteStartTime: null,
+    bitePeak: 0, settleStart: null, lastBiteEndTime: 0,
   });
 
   ['durations', 'pace', 'gaps'].forEach(k => {
@@ -516,8 +567,11 @@ async function submitSurvey(e) {
   showSubmitStatus('Sending…', '');
 
   try {
-    const res = await fetch(CONFIG.SUBMIT_URL, {
+    // Google Apps Script requires no-cors — data still lands in the sheet,
+    // but we cannot read the response body (opaque response).
+    await fetch(CONFIG.SUBMIT_URL, {
       method: 'POST',
+      mode: 'no-cors',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name, context, stress, distraction, notes,
@@ -528,14 +582,12 @@ async function submitSurvey(e) {
         bite_durations: biteDurs,
       }),
     });
-    if (res.ok) {
-      showSubmitStatus('Submitted successfully! ✓', 'success');
-      ui.btnSubmit.textContent = 'Submitted ✓';
-    } else {
-      throw new Error(`HTTP ${res.status}`);
-    }
+    // Reaching here means the request was sent — treat as success
+    showSubmitStatus('Submitted successfully! ✓', 'success');
+    ui.btnSubmit.textContent = 'Submitted ✓';
   } catch (err) {
-    showSubmitStatus('Submission failed. Check connection and try again.', 'error');
+    // Only fires on network-level failure (offline, DNS, etc.)
+    showSubmitStatus('Submission failed. Check your connection and try again.', 'error');
     ui.btnSubmit.disabled = false;
     console.error('[BiteTrack]', err);
   }
