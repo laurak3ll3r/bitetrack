@@ -556,7 +556,7 @@ async function submitSurvey(e) {
   const food        = ui.fieldFood.value.trim();
   const notes       = ui.fieldNotes.value.trim();
 
-  if (!name || !context || !stress || !distraction) {
+  if (!context || !stress || !distraction) {
     showSubmitStatus('Please fill in all required fields.', 'error');
     return;
   }
@@ -578,8 +578,8 @@ async function submitSurvey(e) {
       headers: {
         'Content-Type':  'application/json',
         'api_token':     CONFIG.DATAFOUNDRY_TOKEN,
-        'resource_id':   `${name}_${food || 'unknown'}_${new Date().toISOString().slice(0,10)}`,  // e.g. "Anna_pasta_2026-03-16"
-        'token':         `${name}_${food || 'unknown'}_${new Date().toISOString().slice(0,10)}`,  // same identifier as token
+        'resource_id':   `anonymous_${food || 'unknown'}_${new Date().toISOString().slice(0,10)}`,  // e.g. "Anna_pasta_2026-03-16"
+        'token':         `anonymous_${food || 'unknown'}_${new Date().toISOString().slice(0,10)}`,  // same identifier as token
       },
       body: JSON.stringify({
         name,
